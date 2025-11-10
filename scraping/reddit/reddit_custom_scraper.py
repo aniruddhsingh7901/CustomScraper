@@ -24,8 +24,14 @@ from scraping.reddit import model
 from scraping.scraper import ScrapeConfig, Scraper, ValidationResult
 from common.protocol import KeywordMode
 from scraping.reddit.model import RedditContent, RedditDataType
-from typing import List
+from typing import List, Optional, AsyncIterator, Union, Iterable, Set
 from dotenv import load_dotenv
+from scraping.reddit.options import RedditScrapeOptions, ListingType, TimeFilter, SortMode, CommentHarvestMode
+from scraping.reddit.planner import build_plan, expand_to_targets, SubmissionsTarget, SearchTarget, UserTimelineTarget, CommentsTarget
+from scraping.reddit.session_pool import AccountPool, RedditClientManager
+from scraping.reddit.checkpointer import Checkpointer
+from scraping.reddit.rate_limiter import SqliteTokenBucketLimiter
+from scraping.reddit.metrics import inc_items, inc_request, measure_replace_more
 
 
 load_dotenv()
@@ -35,6 +41,8 @@ class RedditCustomScraper(Scraper):
     """
     Scrapes Reddit data using a personal reddit account.
     """
+    # Global throttle for heavy comment expansions
+    REPLACE_MORE_SEMAPHORE = asyncio.Semaphore(5)
 
     USER_AGENT = f"User-Agent: python: {os.getenv('REDDIT_USERNAME')}"
 
@@ -499,6 +507,335 @@ class RedditCustomScraper(Scraper):
             )
 
         return content
+
+    async def scrape_advanced(
+        self,
+        scrape_config: ScrapeConfig,
+        options: RedditScrapeOptions,
+        pool: Optional[AccountPool] = None,
+    ) -> List[DataEntity]:
+        """
+        Advanced Reddit scraper with multi-surface orchestration, optional full comment-tree
+        harvesting, dedupe, and checkpointing (SQLite), using either a provided AccountPool
+        or a single local client from environment.
+        """
+        bt.logging.trace(
+            f"Reddit scrape_advanced start: config={scrape_config}, options={options}"
+        )
+
+        # Determine subreddit target ("all" if no label)
+        assert (not scrape_config.labels or len(scrape_config.labels) <= 1), "Can only scrape 1 subreddit at a time."
+        subreddit_name = normalize_label(scrape_config.labels[0]) if scrape_config.labels else "all"
+
+        # Build plan targets
+        plan = build_plan(subreddit_name, options, scrape_config.date_range)
+        targets = expand_to_targets(plan)
+
+        # Checkpointer with deterministic job key (derived from config + options)
+        checkpointer = Checkpointer()
+        job_key = self._make_job_key(subreddit_name, scrape_config, options)
+        checkpoint = await checkpointer.load_progress(job_key) or {}
+        seen_ids: Set[str] = set(checkpoint.get("seen_ids", []))  # fullname-based
+        seen_urls: Set[str] = set(checkpoint.get("seen_urls", []))
+        bt.logging.trace(f"Loaded checkpoint for key={job_key}: seen_ids={len(seen_ids)}")
+
+        # Optional rate limiter for heavy ops
+        limiter = SqliteTokenBucketLimiter()
+        await limiter.ensure_bucket("replace_more", capacity=5.0, refill_rate=2.0)
+
+        # Acquire reddit client (from pool or local env)
+        lease: Optional["AccountLease"] = None
+        reddit: Optional[asyncpraw.Reddit] = None
+        try:
+            if pool is not None:
+                lease = await pool.acquire()
+                reddit = lease.reddit
+            else:
+                reddit = asyncpraw.Reddit(
+                    client_id=os.getenv("REDDIT_CLIENT_ID"),
+                    client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+                    username=os.getenv("REDDIT_USERNAME"),
+                    password=os.getenv("REDDIT_PASSWORD"),
+                    user_agent=self.USER_AGENT,
+                )
+
+            collected: List[RedditContent] = []
+            total_target = options.pagination_target or float("inf")
+
+            # Execute targets (sequential with per-target internal async)
+            for tgt in targets:
+                if isinstance(tgt, SubmissionsTarget):
+                    async for submission in self._iter_submissions(reddit, tgt.subreddit, tgt.listing, tgt.time_filter, tgt.limit):
+                        # Stop if we have enough
+                        if len(collected) >= total_target:
+                            break
+
+                        try:
+                            await submission.load()
+                        except Exception:
+                            continue
+
+                        sub_content = self._best_effort_parse_submission(submission)
+                        if not sub_content:
+                            continue
+
+                        # NSFW+media filter (same rule as in scrape())
+                        if sub_content.is_nsfw and sub_content.media:
+                            continue
+
+                        # Dedup on fullname and URI
+                        if sub_content.id in seen_ids:
+                            continue
+                        if options.dedupe_on_uri and sub_content.url in seen_urls:
+                            continue
+
+                        collected.append(sub_content)
+                        seen_ids.add(sub_content.id)
+                        seen_urls.add(sub_content.url)
+                        inc_items("post", subreddit_name, 1)
+
+                        # Optionally harvest comments
+                        if options.include_comments and options.harvest_mode != CommentHarvestMode.POST_ONLY:
+                            try:
+                                if options.harvest_mode == CommentHarvestMode.TOP_LEVEL_ONLY:
+                                    # Load top-level only
+                                    try:
+                                        await submission.comments.replace_more(limit=0)
+                                    except Exception:
+                                        pass
+                                    top_level = [c for c in list(submission.comments) if hasattr(c, "body")]
+                                    for c in top_level:
+                                        if len(collected) >= total_target:
+                                            break
+                                        c_content = self._best_effort_parse_comment(c)
+                                        if c_content:
+                                            # NSFW+media rule is already encoded into comment.is_nsfw
+                                            if c_content.id not in seen_ids and (not options.dedupe_on_uri or c_content.url not in seen_urls):
+                                                collected.append(c_content)
+                                                seen_ids.add(c_content.id)
+                                                seen_urls.add(c_content.url)
+                                                inc_items("comment", subreddit_name, 1)
+                                elif options.harvest_mode == CommentHarvestMode.ALL_COMMENTS:
+                                    # Heavy path: full tree expansion
+                                    await limiter.acquire("replace_more", tokens=1.0, timeout=30.0)
+                                    # Gate concurrent expansions with a semaphore
+                                    await self.REPLACE_MORE_SEMAPHORE.acquire()
+                                    try:
+                                        with measure_replace_more():
+                                            try:
+                                                await submission.comments.replace_more(limit=None)
+                                            except Exception:
+                                                # Fallback to partial tree if expansion fails
+                                                pass
+                                        flat_comments = list(submission.comments.list())
+                                    finally:
+                                        self.REPLACE_MORE_SEMAPHORE.release()
+
+                                    # Depth guard
+                                    depth_limit = options.expand_comment_depth_limit
+                                    for c in flat_comments:
+                                        if len(collected) >= total_target:
+                                            break
+                                        if depth_limit is not None and getattr(c, "depth", 0) > depth_limit:
+                                            continue
+                                        if not hasattr(c, "body"):
+                                            continue
+                                        c_content = self._best_effort_parse_comment(c)
+                                        if c_content and c_content.id not in seen_ids and (not options.dedupe_on_uri or c_content.url not in seen_urls):
+                                            collected.append(c_content)
+                                            seen_ids.add(c_content.id)
+                                            seen_urls.add(c_content.url)
+                                            inc_items("comment", subreddit_name, 1)
+                            except Exception as e:
+                                bt.logging.trace(f"Comment harvest failed: {e}")
+
+                elif isinstance(tgt, SearchTarget):
+                    async for item in self._iter_search(reddit, tgt.subreddit, tgt.query, tgt.sort, tgt.time_filter, tgt.limit):
+                        if len(collected) >= total_target:
+                            break
+                        # Treat as submission for now (search returns submissions)
+                        try:
+                            await item.load()
+                        except Exception:
+                            continue
+                        s_content = self._best_effort_parse_submission(item)
+                        if not s_content:
+                            continue
+                        if s_content.is_nsfw and s_content.media:
+                            continue
+                        if s_content.id in seen_ids:
+                            continue
+                        if options.dedupe_on_uri and s_content.url in seen_urls:
+                            continue
+                        collected.append(s_content)
+                        seen_ids.add(s_content.id)
+                        seen_urls.add(s_content.url)
+                        inc_items("post", subreddit_name, 1)
+
+                elif isinstance(tgt, UserTimelineTarget):
+                    async for u_item in self._iter_user_timeline(reddit, tgt.username, tgt.surface, tgt.limit):
+                        if len(collected) >= total_target:
+                            break
+                        try:
+                            await u_item.load()
+                        except Exception:
+                            continue
+                        if hasattr(u_item, "title"):
+                            content = self._best_effort_parse_submission(u_item)
+                            item_type = "post"
+                        else:
+                            content = self._best_effort_parse_comment(u_item)
+                            item_type = "comment"
+                        if not content:
+                            continue
+                        if content.data_type == RedditDataType.POST and content.is_nsfw and content.media:
+                            continue
+                        if content.id in seen_ids:
+                            continue
+                        if options.dedupe_on_uri and content.url in seen_urls:
+                            continue
+                        collected.append(content)
+                        seen_ids.add(content.id)
+                        seen_urls.add(content.url)
+                        inc_items(item_type, subreddit_name, 1)
+
+                # Persist checkpoint after each target
+                await checkpointer.save_progress(
+                    job_key,
+                    {
+                        "seen_ids": list(seen_ids),
+                        "seen_urls": list(seen_urls),
+                        "last_timestamp": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                        "subreddit": subreddit_name,
+                    },
+                )
+
+                if len(collected) >= total_target:
+                    break
+
+            # Convert to DataEntities and return
+            data_entities: List[DataEntity] = []
+            for content in collected:
+                data_entities.append(RedditContent.to_data_entity(content=content))
+            bt.logging.success(f"scrape_advanced completed for {subreddit_name}: {len(data_entities)} entities.")
+            return data_entities
+
+        finally:
+            # Release/close reddit client
+            try:
+                if lease is not None:
+                    await lease.release(success=True)
+                elif reddit is not None:
+                    await reddit.close()
+            except Exception:
+                pass
+
+    def _make_job_key(self, subreddit_name: str, scrape_config: ScrapeConfig, options: RedditScrapeOptions) -> str:
+        # Build a deterministic key based on subreddit, date range, and options
+        import hashlib, json
+        start = scrape_config.date_range.start.isoformat()
+        end = scrape_config.date_range.end.isoformat()
+        try:
+            opts_json = options.model_dump_json()
+        except Exception:
+            try:
+                opts_json = options.json()
+            except Exception:
+                opts_json = "{}"
+        digest = hashlib.sha1(opts_json.encode("utf-8")).hexdigest()[:10]
+        return f"reddit:{subreddit_name}:{start}:{end}:{digest}"
+
+    async def _iter_submissions(
+        self,
+        reddit: asyncpraw.Reddit,
+        subreddit_name: str,
+        listing: ListingType,
+        time_filter: Optional[TimeFilter],
+        per_listing_limit: int,
+    ) -> AsyncIterator[asyncpraw.models.Submission]:
+        sub = await reddit.subreddit(subreddit_name)
+        tf = (time_filter.value if time_filter else None)
+        try:
+            if listing == ListingType.NEW:
+                async for s in sub.new(limit=per_listing_limit):
+                    inc_request("subreddit.new")
+                    yield s
+            elif listing == ListingType.HOT:
+                async for s in sub.hot(limit=per_listing_limit):
+                    inc_request("subreddit.hot")
+                    yield s
+            elif listing == ListingType.TOP:
+                async for s in sub.top(limit=per_listing_limit, time_filter=(tf or "all")):
+                    inc_request("subreddit.top")
+                    yield s
+            elif listing == ListingType.RISING:
+                async for s in sub.rising(limit=per_listing_limit):
+                    inc_request("subreddit.rising")
+                    yield s
+            elif listing == ListingType.CONTROVERSIAL:
+                async for s in sub.controversial(limit=per_listing_limit, time_filter=(tf or "all")):
+                    inc_request("subreddit.controversial")
+                    yield s
+            else:
+                return
+        except Exception as e:
+            bt.logging.trace(f"_iter_submissions error: {e}")
+
+    async def _iter_search(
+        self,
+        reddit: asyncpraw.Reddit,
+        subreddit_name: str,
+        query: str,
+        sort: SortMode,
+        time_filter: Optional[TimeFilter],
+        per_listing_limit: int,
+    ) -> AsyncIterator[asyncpraw.models.Submission]:
+        sub = await reddit.subreddit(subreddit_name)
+        try:
+            async for item in sub.search(
+                query=query,
+                sort=sort.value if sort else "new",
+                time_filter=(time_filter.value if time_filter else "all"),
+                limit=per_listing_limit,
+            ):
+                inc_request("subreddit.search")
+                yield item
+        except Exception as e:
+            bt.logging.trace(f"_iter_search error: {e}")
+
+    async def _iter_user_timeline(
+        self,
+        reddit: asyncpraw.Reddit,
+        username: str,
+        surface: str,
+        per_listing_limit: int,
+    ) -> AsyncIterator[Union[asyncpraw.models.Submission, asyncpraw.models.Comment]]:
+        try:
+            user = await reddit.redditor(username)
+            if surface == "submissions":
+                async for s in user.submissions.new(limit=per_listing_limit):
+                    inc_request("user.submissions.new")
+                    yield s
+            else:
+                async for c in user.comments.new(limit=per_listing_limit):
+                    inc_request("user.comments.new")
+                    yield c
+        except Exception as e:
+            bt.logging.trace(f"_iter_user_timeline error for {username}: {e}")
+
+    def _merge_and_dedupe(self, contents: List[RedditContent], dedupe_on_uri: bool) -> List[RedditContent]:
+        seen_ids: Set[str] = set()
+        seen_urls: Set[str] = set()
+        merged: List[RedditContent] = []
+        for c in contents:
+            if c.id in seen_ids:
+                continue
+            if dedupe_on_uri and c.url in seen_urls:
+                continue
+            merged.append(c)
+            seen_ids.add(c.id)
+            seen_urls.add(c.url)
+        return merged
 
 
 async def test_scrape():
