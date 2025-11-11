@@ -185,6 +185,26 @@ class AccountPool:
             )
             """
         )
+        # Checkpoints table (in accounts.db) to resume workers after crash/restart.
+        # Schema:
+        #   checkpoints(worker_id TEXT PRIMARY KEY,
+        #               account_id TEXT,
+        #               last_subreddit TEXT,
+        #               last_post_id TEXT,
+        #               last_comment_id TEXT,
+        #               updated_at REAL)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                worker_id TEXT PRIMARY KEY,
+                account_id TEXT,
+                last_subreddit TEXT,
+                last_post_id TEXT,
+                last_comment_id TEXT,
+                updated_at REAL
+            )
+            """
+        )
         self._conn.commit()
 
     async def _ensure_proxy_pool(self) -> None:
